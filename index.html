@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Grbl Precise Controller</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background: #eef2f3; color: #333; }
+        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); max-width: 700px; margin: auto; }
+        h2 { text-align: center; color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom: 10px; }
+        #log { width: 100%; height: 250px; background: #1e1e1e; color: #00ff00; overflow-y: scroll; font-family: 'Consolas', monospace; padding: 15px; margin-top: 15px; border-radius: 8px; font-size: 13px; line-height: 1.4; box-sizing: border-box; }
+        .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 20px; }
+        button { padding: 14px; cursor: pointer; border: none; border-radius: 6px; background: #3498db; color: white; font-weight: bold; transition: 0.2s; }
+        button:hover { background: #2980b9; }
+        button:disabled { background: #bdc3c7; cursor: not-allowed; }
+        button.danger { background: #e74c3c; }
+        button.danger:hover { background: #c0392b; }
+        .status-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; font-size: 14px; font-weight: bold; }
+        .indicator { padding: 4px 10px; border-radius: 20px; background: #95a5a6; color: white; }
+        .connected { background: #27ae60; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>😊 CNC Smile Painter</h2>
+    <div class="status-bar">
+        <span>Machine Status:</span>
+        <span id="status" class="indicator">OFFLINE</span>
+    </div>
+    
+    <div class="btns">
+        <button id="connect">1. 接続 (Connect)</button>
+        <button id="setup" disabled>2. 原点設定 ($H & G10)</button>
+        <button id="draw" disabled>3. スマイルを描く (Draw)</button>
+        <button id="stop" class="danger">緊急停止 (!)</button>
+    </div>
+
+    <div id="log">--- System Ready ---<br></div>
+</div>
+
+<script>
+let port, reader, writer;
+let lastReceivedResponse = "";
+const logDiv = document.getElementById('log');
+
+// --- 描画データ (一歩ずつ確実に送るための分離コード) ---
+const smileInCircleGcode = [
+    "G90", "G21",
+    "M3 S180", "G4 P0.5",
+    
+    // 1. 外円 (直径5mm)
+    "G0 X7.5 Y5 F1000",
+    "M3 S90", "G4 P0.5",
+    "G2 X7.5 Y5 I-2.5 J0 F500",
+    "M3 S180", "G4 P0.3",
+    
+    // 2. 右目
+    "G0 X4 Y5.2",
+    "M3 S90", "G4 P0.3",
+    "G1 X4.1 Y5.2 F300",
+    "M3 S180", "G4 P0.3",
+    
+    // 3. 左目
+    "G0 X6 Y5.2",
+    "M3 S90", "G4 P0.3",
+    "G1 X6.1 Y5.2 F300",
+    "M3 S180", "G4 P0.3",
+    
+    // 4. 口
+    "G0 X4 Y4.3",          // 左端
+    "M3 S90", 
+    "G4 P0.5",
+    "G1 X5 Y3.5 F300",     // 中央下
+    "G1 X6 Y4.3",          // 右端
+    
+    // 5. 終了
+    "M3 S180", "G4 P0.5",
+    "G0 X0 Y0"
+];
+
+function addLog(text, isSelf = false) {
+    const color = isSelf ? "#fff" : "#0f0";
+    logDiv.innerHTML += `<div style="color:${color}">${isSelf ? '> ' : ''}${text}</div>`;
+    logDiv.scrollTop = logDiv.scrollHeight;
+}
+
+// 接続ボタン
+document.getElementById('connect').onclick = async () => {
+    try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        document.getElementById('status').innerText = "CONNECTED";
+        document.getElementById('status').classList.add("connected");
+        document.getElementById('setup').disabled = false;
+        readLoop();
+    } catch (e) { addLog("Error: " + e); }
+};
+
+// 送信関数
+async function sendCommand(cmd) {
+    const encoder = new TextEncoder();
+    addLog(cmd, true);
+    const writer = port.writable.getWriter();
+    await writer.write(encoder.encode(cmd + "\n"));
+    writer.releaseLock();
+}
+
+// "ok" または "error" が返ってくるまで非同期で待機する
+async function waitForOk() {
+    return new Promise(resolve => {
+        const check = () => {
+            if (lastReceivedResponse.includes("ok") || lastReceivedResponse.includes("error")) {
+                lastReceivedResponse = ""; // バッファリセット
+                resolve();
+            } else {
+                setTimeout(check, 10);
+            }
+        };
+        check();
+    });
+}
+
+// 原点設定
+document.getElementById('setup').onclick = async () => {
+    await sendCommand("$H");
+    addLog("Waiting for Homing to finish...");
+    await new Promise(r => setTimeout(r, 6000)); // ホーミング完了まで少し待機
+    await sendCommand("G10 L20 P1 X20 Y-5 Z0");
+    document.getElementById('draw').disabled = false;
+    addLog("Coordinate system set. Ready to draw!");
+};
+
+// 描画実行 (ここが重要！)
+document.getElementById('draw').onclick = async () => {
+    addLog("Drawing started...");
+    for (let line of smileInCircleGcode) {
+        await sendCommand(line);
+        await waitForOk(); // 返信を待ってから次へ
+    }
+    addLog("--- SUCCESS: Drawing Completed ---");
+};
+
+// 緊急停止
+document.getElementById('stop').onclick = () => sendCommand("!");
+
+// 受信ループ
+async function readLoop() {
+    while (port.readable) {
+        const reader = port.readable.getReader();
+        try {
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                const text = new TextDecoder().decode(value);
+                lastReceivedResponse += text;
+                addLog(text);
+            }
+        } finally { reader.releaseLock(); }
+    }
+}
+</script>
+</body>
+</html>
