@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Universal G-code Sender</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background: #eef2f3; color: #333; }
+        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); max-width: 700px; margin: auto; }
+        h2 { text-align: center; color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom: 10px; }
+        #log { width: 100%; height: 300px; background: #1e1e1e; color: #00ff00; overflow-y: scroll; font-family: 'Consolas', monospace; padding: 15px; margin-top: 15px; border-radius: 8px; font-size: 13px; line-height: 1.4; box-sizing: border-box; }
+        .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 20px; }
+        button { padding: 14px; cursor: pointer; border: none; border-radius: 6px; background: #3498db; color: white; font-weight: bold; transition: 0.2s; }
+        button:hover { background: #2980b9; }
+        button:disabled { background: #bdc3c7; cursor: not-allowed; }
+        button.danger { background: #e74c3c; }
+        button.primary { background: #27ae60; }
+        button.primary:hover { background: #219150; }
+        .status-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; font-size: 14px; font-weight: bold; }
+        .indicator { padding: 4px 10px; border-radius: 20px; background: #95a5a6; color: white; }
+        .connected { background: #27ae60; }
+        .file-info { margin-top: 10px; font-size: 12px; color: #666; text-align: center; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>🎨 G-code Serial Executor</h2>
+    <div class="status-bar">
+        <span>Machine Status:</span>
+        <span id="status" class="indicator">OFFLINE</span>
+    </div>
+    
+    <div class="btns">
+        <button id="connect">1. 接続 (Connect)</button>
+        <button id="setup" disabled>2. 原点設定 ($H & G10)</button>
+        
+        <input type="file" id="gcodeFile" accept=".gcode,.nc,.txt" style="display:none">
+        <button id="fileSelectBtn" disabled>3. Gコード読込 (Open File)</button>
+        <button id="draw" class="primary" disabled>4. 実行開始 (Run)</button>
+        
+        <button id="stop" class="danger">緊急停止 (!)</button>
+    </div>
+    <div id="fileNameDisplay" class="file-info">ファイルが選択されていません</div>
+
+    <div id="log">--- System Ready ---<br></div>
+</div>
+
+<script>
+let port, reader, writer;
+let lastReceivedResponse = "";
+let gcodeLines = [];
+const logDiv = document.getElementById('log');
+const statusInd = document.getElementById('status');
+const fileInput = document.getElementById('gcodeFile');
+const fileBtn = document.getElementById('fileSelectBtn');
+const drawBtn = document.getElementById('draw');
+const setupBtn = document.getElementById('setup');
+
+function addLog(text, isSelf = false) {
+    const color = isSelf ? "#fff" : "#0f0";
+    logDiv.innerHTML += `<div style="color:${color}">${isSelf ? '> ' : ''}${text}</div>`;
+    logDiv.scrollTop = logDiv.scrollHeight;
+}
+
+// 1. シリアルポート接続
+document.getElementById('connect').onclick = async () => {
+    try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        statusInd.innerText = "CONNECTED";
+        statusInd.classList.add("connected");
+        setupBtn.disabled = false;
+        readLoop();
+        addLog("Serial Port Connected.");
+    } catch (e) { addLog("Error: " + e); }
+};
+
+// 2. 原点設定 (ホーミング & オフセット)
+setupBtn.onclick = async () => {
+    await sendCommand("$H");
+    addLog("Homing... Please wait.");
+    await new Promise(r => setTimeout(r, 6000)); 
+    await sendCommand("G10 L20 P1 X20 Y-5 Z0");
+    
+    fileBtn.disabled = false;
+    addLog("Ready to load G-code.");
+};
+
+// 3. ファイル読み込み処理
+fileBtn.onclick = () => fileInput.click();
+
+fileInput.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const text = await file.text();
+    gcodeLines = text.split(/\r?\n/)
+                     .map(line => line.trim())
+                     .filter(line => line.length > 0);
+    
+    document.getElementById('fileNameDisplay').innerText = `Loaded: ${file.name} (${gcodeLines.length} lines)`;
+    addLog(`File loaded: ${file.name}`);
+    drawBtn.disabled = false;
+};
+
+// 4. 実行処理
+drawBtn.onclick = async () => {
+    if (gcodeLines.length === 0) return;
+    
+    addLog("--- Start Execution ---");
+    drawBtn.disabled = true;
+    fileBtn.disabled = true;
+
+    // ファイル内のGコードを実行
+    for (let i = 0; i < gcodeLines.length; i++) {
+        let line = gcodeLines[i];
+        const cleanLine = line.split(';')[0].trim();
+        if (cleanLine) {
+            await sendCommand(cleanLine);
+            await waitForOk(); 
+        }
+    }
+
+    // 全ての行が終わった後、指定の座標へ移動
+    addLog("Moving to final position...");
+    await sendCommand("G1 X-6 Y0");
+    await waitForOk();
+    
+    addLog("--- SUCCESS: Execution Completed ---");
+    drawBtn.disabled = false;
+    fileBtn.disabled = false;
+};
+
+// --- 通信コア関数 ---
+
+async function sendCommand(cmd) {
+    const encoder = new TextEncoder();
+    addLog(cmd, true);
+    const writer = port.writable.getWriter();
+    await writer.write(encoder.encode(cmd + "\n"));
+    writer.releaseLock();
+}
+
+async function waitForOk() {
+    return new Promise(resolve => {
+        const check = () => {
+            if (lastReceivedResponse.includes("ok") || lastReceivedResponse.includes("error")) {
+                lastReceivedResponse = ""; 
+                resolve();
+            } else {
+                setTimeout(check, 5);
+            }
+        };
+        check();
+    });
+}
+
+// 緊急停止 (Feed Hold)
+document.getElementById('stop').onclick = () => {
+    sendCommand("!");
+    addLog("!!! EMERGENCY STOP !!!");
+};
+
+// 受信ループ
+async function readLoop() {
+    while (port.readable) {
+        const reader = port.readable.getReader();
+        try {
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                const text = new TextDecoder().decode(value);
+                lastReceivedResponse += text;
+                addLog(text);
+            }
+        } catch (e) { addLog("Read Error: " + e); }
+        finally { reader.releaseLock(); }
+    }
+}
+</script>
+</body>
+</html>
